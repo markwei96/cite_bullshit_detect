@@ -36,6 +36,16 @@ def main():
     output_path = Path(args.output) if args.output else OUTPUT_DIR / "report.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Check input files exist
+    if not MAIN_TEX.exists():
+        logger.error(f"Main .tex file not found: {MAIN_TEX}")
+        logger.error(f"Please place your LaTeX files in {MAIN_TEX.parent}")
+        return
+    if not BIB_FILE.exists():
+        logger.error(f"Bibliography file not found: {BIB_FILE}")
+        logger.error(f"Please place your .bib file in {BIB_FILE.parent}")
+        return
+
     # Step 1: Parse LaTeX and BibTeX
     logger.info("=" * 50)
     logger.info("Step 1: Parsing LaTeX and BibTeX files...")

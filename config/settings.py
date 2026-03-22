@@ -18,6 +18,7 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 # Ensure output directories exist
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # LLM settings
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
