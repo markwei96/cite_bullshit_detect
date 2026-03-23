@@ -4,16 +4,19 @@ Citation Bullshit Detector - Main Pipeline
 Usage:
     python main.py                          # Full pipeline
     python main.py --skip-download          # Skip PDF download, use existing PDFs
-    python main.py --pdf-parser pymupdf     # Use PyMuPDF instead of MinerU
+    python main.py --pdf-parser pymupdf     # Use PyMuPDF instead of FireRed-OCR
     python main.py --output report.md       # Custom output path
 """
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from config.settings import MAIN_TEX, BIB_FILE, PDF_DIR, OUTPUT_DIR, PDF_PARSER
-from core.parser import parse_thesis
+from config.settings import INPUT_DIR, PDF_DIR, OUTPUT_DIR, PDF_PARSER
+from core.parser import (
+    parse_thesis, discover_main_tex, list_tex_files, find_bib_files
+)
 from core.downloader import download_all
 from core.rag_engine import find_relevant_passages
 from core.llm_analyzer import LLMAnalyzer, VerificationResult
@@ -21,6 +24,37 @@ from utils.pdf_extractor import get_extractor, extract_text_chunked
 from utils.logger import get_logger
 
 logger = get_logger("main")
+
+
+def _resolve_main_tex(input_dir: Path) -> Path | None:
+    """Auto-discover or ask user to select the main .tex file."""
+    main_tex = discover_main_tex(input_dir)
+    if main_tex:
+        logger.info(f"Main tex file: {main_tex}")
+        return main_tex
+
+    # Could not auto-detect, list all .tex files for user
+    tex_files = list_tex_files(input_dir)
+    if not tex_files:
+        logger.error(f"No .tex files found in {input_dir}")
+        logger.error("Please place your LaTeX files in the data/input/ directory.")
+        return None
+
+    print(f"\nMultiple .tex files found in {input_dir}:")
+    for i, f in enumerate(tex_files):
+        rel = f.relative_to(input_dir)
+        print(f"  [{i + 1}] {rel}")
+
+    while True:
+        try:
+            choice = input("\nWhich is the main .tex file? Enter number: ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(tex_files):
+                return tex_files[idx]
+            print(f"Please enter a number between 1 and {len(tex_files)}")
+        except (ValueError, EOFError):
+            print("Invalid input. Please enter a number.")
+            return None
 
 
 def main():
@@ -31,27 +65,39 @@ def main():
                         help="Output report path (default: data/output/report.md)")
     parser.add_argument("--pdf-parser", default=PDF_PARSER, choices=["firered", "mineru", "pymupdf"],
                         help="PDF parser to use (default: firered)")
+    parser.add_argument("--input-dir", default=None,
+                        help="Input directory containing .tex and .bib files (default: data/input/)")
     args = parser.parse_args()
 
+    input_dir = Path(args.input_dir) if args.input_dir else INPUT_DIR
     output_path = Path(args.output) if args.output else OUTPUT_DIR / "report.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check input files exist
-    if not MAIN_TEX.exists():
-        logger.error(f"Main .tex file not found: {MAIN_TEX}")
-        logger.error(f"Please place your LaTeX files in {MAIN_TEX.parent}")
+    # Step 0: Discover main .tex and .bib files
+    logger.info("=" * 50)
+    logger.info("Step 0: Discovering input files...")
+
+    main_tex = _resolve_main_tex(input_dir)
+    if main_tex is None:
         return
-    if not BIB_FILE.exists():
-        logger.error(f"Bibliography file not found: {BIB_FILE}")
-        logger.error(f"Please place your .bib file in {BIB_FILE.parent}")
+
+    bib_files = find_bib_files(main_tex)
+    if not bib_files:
+        logger.error(f"No .bib files found. Check your main tex or place .bib files in {input_dir}")
         return
+
+    logger.info(f"Bib files: {[f.name for f in bib_files]}")
 
     # Step 1: Parse LaTeX and BibTeX
     logger.info("=" * 50)
     logger.info("Step 1: Parsing LaTeX and BibTeX files...")
-    records = parse_thesis(MAIN_TEX, BIB_FILE)
+    records = parse_thesis(main_tex, bib_files)
     logger.info(f"Found {len(records)} unique cited references with "
                 f"{sum(len(r.occurrences) for r in records)} total citation occurrences")
+
+    if not records:
+        logger.warning("No citations found. Nothing to verify.")
+        return
 
     # Step 2: Download PDFs
     download_results = {}

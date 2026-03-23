@@ -9,13 +9,10 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 # Data paths
 INPUT_DIR = PROJECT_ROOT / "data" / "input"
-MAIN_TEX = INPUT_DIR / "main.tex"
-TEX_DIR = INPUT_DIR / "tex"
-BIB_FILE = INPUT_DIR / "ref.bib"
 PDF_DIR = PROJECT_ROOT / "data" / "pdfs"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 
-# Ensure output directories exist
+# Ensure directories exist
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 INPUT_DIR.mkdir(parents=True, exist_ok=True)

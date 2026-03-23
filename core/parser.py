@@ -1,7 +1,6 @@
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import bibtexparser
 
@@ -10,8 +9,17 @@ from utils.text_cleaner import strip_latex_commands, split_sentences_chinese
 
 logger = get_logger(__name__)
 
-UPCITE_PATTERN = re.compile(r'\\upcite\{([^}]+)\}')
+# Citation patterns: \upcite{}, \cite{}, \citep{}, \citet{}, etc.
+CITE_PATTERNS = [
+    re.compile(r'\\upcite\{([^}]+)\}'),
+    re.compile(r'\\cite\{([^}]+)\}'),
+    re.compile(r'\\citep\{([^}]+)\}'),
+    re.compile(r'\\citet\{([^}]+)\}'),
+]
 INPUT_PATTERN = re.compile(r'\\input\{([^}]+)\}')
+INCLUDE_PATTERN = re.compile(r'\\include\{([^}]+)\}')
+BIBLIOGRAPHY_PATTERN = re.compile(r'\\bibliography\{([^}]+)\}')
+ADDBIBRESOURCE_PATTERN = re.compile(r'\\addbibresource\{([^}]+)\}')
 
 
 @dataclass
@@ -44,31 +52,137 @@ class CitationRecord:
     occurrences: list[CitationOccurrence] = field(default_factory=list)
 
 
-def find_tex_files(main_tex_path: Path) -> list[Path]:
-    """Parse main.tex, find all \\input{} directives, return list of .tex paths."""
+# ---------------------------------------------------------------------------
+# Auto-discovery: find main tex, bib files, and sub-tex files
+# ---------------------------------------------------------------------------
+
+def discover_main_tex(input_dir: Path) -> Path | None:
+    """Find the main .tex file in input_dir.
+
+    Strategy:
+    1. If main.tex exists, use it.
+    2. Otherwise, look for the file containing \\documentclass.
+    3. If multiple candidates, return None (caller should ask user).
+    """
+    # Direct match
+    main_tex = input_dir / "main.tex"
+    if main_tex.exists():
+        return main_tex
+
+    # Scan all .tex files for \documentclass
+    tex_files = list(input_dir.rglob("*.tex"))
+    if not tex_files:
+        return None
+
+    if len(tex_files) == 1:
+        return tex_files[0]
+
+    candidates = []
+    for tf in tex_files:
+        try:
+            content = tf.read_text(encoding='utf-8', errors='ignore')
+            if re.search(r'\\documentclass', content):
+                candidates.append(tf)
+        except Exception:
+            continue
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None  # ambiguous, caller should ask user
+
+
+def list_tex_files(input_dir: Path) -> list[Path]:
+    """List all .tex files in input_dir (non-recursive top-level + one level deep)."""
+    files = list(input_dir.rglob("*.tex"))
+    return sorted(files)
+
+
+def find_bib_files(main_tex_path: Path) -> list[Path]:
+    """Parse main .tex to find referenced .bib files via \\bibliography{} or \\addbibresource{}."""
     content = main_tex_path.read_text(encoding='utf-8')
-    input_dir = main_tex_path.parent
-    tex_files = []
-    for match in INPUT_PATTERN.finditer(content):
-        relative = match.group(1)
-        if not relative.endswith('.tex'):
-            relative += '.tex'
-        full_path = input_dir / relative
-        if full_path.exists():
-            tex_files.append(full_path)
+    base_dir = main_tex_path.parent
+    bib_files = []
+
+    # \bibliography{ref} or \bibliography{ref1,ref2}
+    for match in BIBLIOGRAPHY_PATTERN.finditer(content):
+        for name in match.group(1).split(','):
+            name = name.strip()
+            if not name.endswith('.bib'):
+                name += '.bib'
+            path = base_dir / name
+            if path.exists():
+                bib_files.append(path)
+            else:
+                logger.warning(f"Bib file referenced but not found: {path}")
+
+    # \addbibresource{ref.bib}
+    for match in ADDBIBRESOURCE_PATTERN.finditer(content):
+        name = match.group(1).strip()
+        if not name.endswith('.bib'):
+            name += '.bib'
+        path = base_dir / name
+        if path.exists():
+            bib_files.append(path)
         else:
-            logger.warning(f"Referenced tex file not found: {full_path}")
+            logger.warning(f"Bib file referenced but not found: {path}")
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for p in bib_files:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(p)
+
+    # Fallback: if nothing found in main tex, scan for .bib files in the directory
+    if not unique:
+        logger.info("No \\bibliography or \\addbibresource found in main tex, scanning directory...")
+        bib_candidates = list(base_dir.rglob("*.bib"))
+        if bib_candidates:
+            unique = sorted(bib_candidates)
+            logger.info(f"Found bib files by scanning: {[f.name for f in unique]}")
+
+    return unique
+
+
+def find_sub_tex_files(main_tex_path: Path) -> list[Path]:
+    """Parse main .tex to find all \\input{} and \\include{} sub-files."""
+    content = main_tex_path.read_text(encoding='utf-8')
+    base_dir = main_tex_path.parent
+    tex_files = []
+
+    for pattern in [INPUT_PATTERN, INCLUDE_PATTERN]:
+        for match in pattern.finditer(content):
+            # Skip commented-out lines
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_text = content[line_start:match.start()]
+            if '%' in line_text:
+                continue
+
+            relative = match.group(1).strip()
+            if not relative.endswith('.tex'):
+                relative += '.tex'
+            full_path = base_dir / relative
+            if full_path.exists():
+                tex_files.append(full_path)
+            else:
+                logger.warning(f"Referenced tex file not found: {full_path}")
+
     return tex_files
 
 
+# ---------------------------------------------------------------------------
+# Context extraction
+# ---------------------------------------------------------------------------
+
 def _get_paragraph_context(lines: list[str], target_idx: int) -> str:
     """Extract the paragraph containing the target line (text between blank lines)."""
-    # Find paragraph start (go backwards to find blank line)
     start = target_idx
     while start > 0 and lines[start - 1].strip():
         start -= 1
 
-    # Find paragraph end (go forwards to find blank line)
     end = target_idx
     while end < len(lines) - 1 and lines[end + 1].strip():
         end += 1
@@ -82,18 +196,18 @@ def _find_sentence_with_citation(context_clean: str, cite_key: str) -> str:
     if not sentences:
         return context_clean
 
-    # After cleaning, the \upcite{} is removed, so we return the full cleaned context
-    # as the "sentence" since Chinese paragraphs are often one long sentence
-    # For better granularity, return the first 300 chars
     if len(sentences) == 1:
         return sentences[0]
 
-    # Return up to 3 sentences around the middle of the context
     mid = len(sentences) // 2
     start = max(0, mid - 1)
     end = min(len(sentences), mid + 2)
     return ''.join(sentences[start:end])
 
+
+# ---------------------------------------------------------------------------
+# Citation extraction
+# ---------------------------------------------------------------------------
 
 def extract_citations_from_tex(tex_path: Path) -> list[CitationOccurrence]:
     """Extract all citation occurrences with surrounding context from a .tex file."""
@@ -106,32 +220,34 @@ def extract_citations_from_tex(tex_path: Path) -> list[CitationOccurrence]:
         if line.strip().startswith('%'):
             continue
 
-        for match in UPCITE_PATTERN.finditer(line):
-            keys_str = match.group(1)
-            keys = [k.strip() for k in keys_str.split(',')]
+        for pattern in CITE_PATTERNS:
+            for match in pattern.finditer(line):
+                keys_str = match.group(1)
+                keys = [k.strip() for k in keys_str.split(',')]
 
-            # Extract paragraph context
-            context_raw = _get_paragraph_context(lines, line_idx)
-            context_clean = strip_latex_commands(context_raw)
+                context_raw = _get_paragraph_context(lines, line_idx)
+                context_clean = strip_latex_commands(context_raw)
+                sentence = _find_sentence_with_citation(context_clean, keys_str)
 
-            # Find the relevant sentence
-            sentence = _find_sentence_with_citation(context_clean, keys_str)
-
-            for key in keys:
-                occurrences.append(CitationOccurrence(
-                    cite_key=key,
-                    source_file=tex_path.name,
-                    line_number=line_idx + 1,
-                    context_raw=context_raw,
-                    context_clean=context_clean,
-                    sentence_with_cite=sentence
-                ))
+                for key in keys:
+                    occurrences.append(CitationOccurrence(
+                        cite_key=key,
+                        source_file=tex_path.name,
+                        line_number=line_idx + 1,
+                        context_raw=context_raw,
+                        context_clean=context_clean,
+                        sentence_with_cite=sentence
+                    ))
 
     return occurrences
 
 
+# ---------------------------------------------------------------------------
+# BibTeX parsing
+# ---------------------------------------------------------------------------
+
 def parse_bib_file(bib_path: Path) -> dict[str, BibEntry]:
-    """Parse ref.bib and return dict keyed by citation key."""
+    """Parse a .bib file and return dict keyed by citation key."""
     content = bib_path.read_text(encoding='utf-8')
 
     parser = bibtexparser.bparser.BibTexParser(common_strings=True)
@@ -141,7 +257,6 @@ def parse_bib_file(bib_path: Path) -> dict[str, BibEntry]:
         bib_db = bibtexparser.loads(content, parser=parser)
     except Exception as e:
         logger.warning(f"BibTeX parse error (trying to recover): {e}")
-        # Try to fix common issues like extra braces
         content_fixed = _fix_bib_content(content)
         bib_db = bibtexparser.loads(content_fixed, parser=parser)
 
@@ -161,6 +276,16 @@ def parse_bib_file(bib_path: Path) -> dict[str, BibEntry]:
     return entries
 
 
+def parse_bib_files(bib_paths: list[Path]) -> dict[str, BibEntry]:
+    """Parse multiple .bib files and merge results."""
+    all_entries = {}
+    for bib_path in bib_paths:
+        logger.info(f"Parsing bib file: {bib_path.name}")
+        entries = parse_bib_file(bib_path)
+        all_entries.update(entries)
+    return all_entries
+
+
 def _fix_bib_content(content: str) -> str:
     """Attempt to fix common BibTeX formatting issues."""
     lines = content.split('\n')
@@ -168,14 +293,12 @@ def _fix_bib_content(content: str) -> str:
     brace_depth = 0
 
     for line in lines:
-        # Track brace depth
         for char in line:
             if char == '{':
                 brace_depth += 1
             elif char == '}':
                 brace_depth -= 1
 
-        # Skip lines that would make brace depth negative (extra closing braces)
         if brace_depth < 0:
             logger.warning(f"Skipping line with extra closing brace: {line.strip()}")
             brace_depth = 0
@@ -186,19 +309,30 @@ def _fix_bib_content(content: str) -> str:
     return '\n'.join(fixed_lines)
 
 
-def parse_thesis(main_tex: Path, bib_file: Path) -> list[CitationRecord]:
-    """Main entry point: parse the full thesis and return citation records."""
-    logger.info(f"Parsing BibTeX file: {bib_file}")
-    bib_entries = parse_bib_file(bib_file)
-    logger.info(f"Found {len(bib_entries)} BibTeX entries")
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
-    logger.info(f"Finding .tex files from: {main_tex}")
-    tex_files = find_tex_files(main_tex)
-    logger.info(f"Found {len(tex_files)} .tex files")
+def parse_thesis(main_tex: Path, bib_files: list[Path]) -> list[CitationRecord]:
+    """Main entry point: parse the thesis and return citation records.
+
+    Args:
+        main_tex: Path to the main .tex file.
+        bib_files: List of .bib file paths (auto-discovered from main_tex).
+    """
+    # Parse all bib files
+    bib_entries = parse_bib_files(bib_files)
+    logger.info(f"Total BibTeX entries: {len(bib_entries)}")
+
+    # Find sub-tex files referenced from main
+    sub_tex_files = find_sub_tex_files(main_tex)
+    # Always include the main tex itself
+    all_tex_files = [main_tex] + sub_tex_files
+    logger.info(f"Tex files to scan: {[f.name for f in all_tex_files]}")
 
     # Collect all citation occurrences grouped by key
     all_occurrences: dict[str, list[CitationOccurrence]] = {}
-    for tex_file in tex_files:
+    for tex_file in all_tex_files:
         occs = extract_citations_from_tex(tex_file)
         for occ in occs:
             all_occurrences.setdefault(occ.cite_key, []).append(occ)
